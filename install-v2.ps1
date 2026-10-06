@@ -208,14 +208,38 @@ if (-not $tarball) {
         $manifestSource = "bundled fallback"
     }
     if (-not $manifest) { throw "No manifest available: network, cache, and bundled fallback all failed." }
-    Write-Log "Manifest source: $manifestSource | data release: $($manifest.data_release)"
+    $manifestVersion = if ($manifest.version) { $manifest.version } else { $manifest.data_release }
+    Write-Log "Manifest source: $manifestSource | version: $manifestVersion"
 
-    $chunks = @($manifest.chunks)
+    # Normalize chunks: v2 manifest uses `file` for the chunk filename (v1 used `name`)
+    $rawChunks = @($manifest.chunks)
+    if ($rawChunks.Count -eq 0) { throw "Manifest has no chunks." }
+    $chunks = @()
+    foreach ($c in $rawChunks) {
+        $fname = if ($c.file) { [string]$c.file } elseif ($c.name) { [string]$c.name } else { $null }
+        if (-not $fname) { throw "Manifest chunk entry is missing its file/name key." }
+        $chunks += [pscustomobject]@{
+            FileName = $fname
+            Size     = [long]$c.size
+            Sha256   = if ($c.sha256) { "$($c.sha256)".ToLower() } else { $null }
+        }
+    }
     $baseUrl = $manifest.base_url
-    $tarballName = $manifest.tarball.name
-    $tarballSize = [long]$manifest.tarball.size
-    $tarballHash = $manifest.tarball.sha256
-    if ($chunks.Count -eq 0) { throw "Manifest has no chunks." }
+    # v2 manifest drops the tarball{} block: derive tarball name/size from the chunks
+    if ($manifest.tarball -and $manifest.tarball.name) {
+        $tarballName = [string]$manifest.tarball.name
+        $tarballSize = [long]$manifest.tarball.size
+        $tarballHash = $manifest.tarball.sha256
+    } else {
+        # chunk files look like "lampy-new.tar.part-aa" -> tarball "lampy-new.tar"
+        $tarballName = $chunks[0].FileName -replace '\.part-[a-z]{2}$',''
+        if (-not $tarballName -or $tarballName -eq $chunks[0].FileName) {
+            throw "Cannot derive tarball name from chunk file '$($chunks[0].FileName)'."
+        }
+        $tarballSize = [long]($chunks | Measure-Object -Property Size -Sum).Sum
+        $tarballHash = $null
+        Write-Log "Manifest has no tarball block; derived tarball $tarballName ($tarballSize bytes) from $($chunks.Count) chunks."
+    }
     Write-Log "$($chunks.Count) chunks, tarball $($tarballName) ($tarballSize bytes)."
 
     $tarball = Join-Path $dlDir $tarballName
@@ -245,14 +269,14 @@ if (-not $tarball) {
         $needDownload = @()
         foreach ($c in $chunks) {
             $i++
-            $dest = Join-Path $dlDir $c.name
+            $dest = Join-Path $dlDir $c.FileName
             $have = 0
             if (Test-Path $dest) { $have = (Get-Item $dest).Length }
-            $want = [long]$c.size
+            $want = [long]$c.Size
             if ($have -eq $want) {
-                Write-Log "Chunk $i/$($chunks.Count): $($c.name) already complete, skipping."
+                Write-Log "Chunk $i/$($chunks.Count): $($c.FileName) already complete, skipping."
             } else {
-                Write-Log "Chunk $i/$($chunks.Count): $($c.name) missing/partial - will download."
+                Write-Log "Chunk $i/$($chunks.Count): $($c.FileName) missing/partial - will download."
                 $needDownload += $c
             }
         }
@@ -260,8 +284,8 @@ if (-not $tarball) {
         $i = 0
         foreach ($c in $needDownload) {
             $i++
-            Write-Log "Downloading chunk $i/$($needDownload.Count): $($c.name)"
-            Get-ChunkWithRetry "$baseUrl/$($c.name)" (Join-Path $dlDir $c.name) ([long]$c.size) | Out-Null
+            Write-Log "Downloading chunk $i/$($needDownload.Count): $($c.FileName)"
+            Get-ChunkWithRetry "$baseUrl/$($c.FileName)" (Join-Path $dlDir $c.FileName) ([long]$c.Size) | Out-Null
         }
 
         $attempt = 0
@@ -269,23 +293,23 @@ if (-not $tarball) {
             $attempt++
             $bad = @()
             foreach ($c in $chunks) {
-                $dest = Join-Path $dlDir $c.name
-                $want = [long]$c.size
+                $dest = Join-Path $dlDir $c.FileName
+                $want = [long]$c.Size
                 $ok = (Test-Path $dest) -and ((Get-Item $dest).Length -eq $want)
-                if ($ok -and $c.sha256) {
+                if ($ok -and $c.Sha256) {
                     $actual = (Get-FileHash -Path $dest -Algorithm SHA256).Hash.ToLower()
-                    if ($actual -ne $c.sha256) {
-                        Write-Log "  $($c.name) FAILED hash check; will re-download."
+                    if ($actual -ne $c.Sha256) {
+                        Write-Log "  $($c.FileName) FAILED hash check; will re-download."
                         $ok = $false
                     }
                 }
                 if (-not $ok) { $bad += $c }
             }
             foreach ($c in $bad) {
-                $dest = Join-Path $dlDir $c.name
-                Write-Log "Re-downloading $($c.name) ..."
+                $dest = Join-Path $dlDir $c.FileName
+                Write-Log "Re-downloading $($c.FileName) ..."
                 Remove-Item $dest -Force -ErrorAction SilentlyContinue
-                Get-ChunkWithRetry "$baseUrl/$($c.name)" $dest ([long]$c.size) | Out-Null
+                Get-ChunkWithRetry "$baseUrl/$($c.FileName)" $dest ([long]$c.Size) | Out-Null
             }
         } while ($bad.Count -gt 0 -and $attempt -lt 2)
         if ($bad.Count -gt 0) { throw "Chunk verification failed after re-download." }
@@ -295,7 +319,7 @@ if (-not $tarball) {
         $outStream = [System.IO.File]::Create($tarball)
         try {
             foreach ($c in $chunks) {
-                $inStream = [System.IO.File]::OpenRead((Join-Path $dlDir $c.name))
+                $inStream = [System.IO.File]::OpenRead((Join-Path $dlDir $c.FileName))
                 try { $inStream.CopyTo($outStream) } finally { $inStream.Close() }
             }
         } finally { $outStream.Close() }
