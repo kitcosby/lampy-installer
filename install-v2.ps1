@@ -373,7 +373,18 @@ Write-Step "3/6 Building database from source (PostgreSQL, TimescaleDB, pgvector
 # Copy build-database.sh into the distro and run it. This compiles everything
 # from /opt/stage/ sources with no apt, no network, no Docker.
 $buildScript = Join-Path $PSScriptRoot "build-database.sh"
-if (-not (Test-Path $buildScript)) { throw "build-database.sh not found at $buildScript" }
+if (-not (Test-Path $buildScript)) {
+    # Fetch from the repo (same tag as the manifest) so a lone install-v2.ps1 works
+    $buildUrl = "https://raw.githubusercontent.com/kitcosby/lampy-installer/$wantTag/build-database.sh"
+    Write-Output "build-database.sh not found locally; downloading from $buildUrl ..."
+    try {
+        Invoke-WebRequest -Uri $buildUrl -OutFile $buildScript -UseBasicParsing -TimeoutSec 60
+    } catch {
+        throw "build-database.sh not found at $buildScript and download failed: $($_.Exception.Message)"
+    }
+    if (-not (Test-Path $buildScript)) { throw "build-database.sh download failed silently." }
+    Write-Output "Downloaded build-database.sh."
+}
 Write-Output "Copying build script into distro..."
 Get-Content -Path $buildScript -Raw | wsl -d $DistroName -u root -- bash -c "cat > /usr/local/bin/build-database.sh && chmod +x /usr/local/bin/build-database.sh"
 if ($LASTEXITCODE -ne 0) { throw "Failed to copy build-database.sh into distro" }
