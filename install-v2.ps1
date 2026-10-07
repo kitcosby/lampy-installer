@@ -11,6 +11,7 @@
       6. Runs build-database.sh: compiles PostgreSQL 16.10, TimescaleDB 2.17.2,
          pgvector 0.8.0, pgvectorscale 0.9.1 from staged sources (no apt/net/docker)
       7. Initializes PostgreSQL cluster, creates extensions
+      7b. Sets up forum database (role, schema) and patches supervisor config
       8. Stores password in locked file (/root/.lampy-secrets, 600 perms)
       9. Configures supervisord for ollama/apache2/codeserver; postgres via pg_ctl
       10. Registers Scheduled Task for boot startup
@@ -369,6 +370,33 @@ if ($InstallMode -eq "repair" -and $existing) {
     Write-Output "Distro '$DistroName' imported."
 }
 
+Write-Step "2b/6 Refreshing Bible website from GitHub (Kit 2026-10-07)"
+# The base image predates the interlinear page. Fetch the latest website
+# files from cosbykit-afk/bible-project so fresh installs get the current
+# version (interlinear, papyrus theme, variant fixes).
+$bibleBase = "https://raw.githubusercontent.com/cosbykit-afk/bible-project/master/website"
+$bibleFiles = @("app_v2.py", "papyrus-tile.png")
+$tmpDir = Join-Path $env:TEMP "lampy-bible-refresh"
+New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+foreach ($f in $bibleFiles) {
+    $url = "$bibleBase/$f"
+    $dest = Join-Path $tmpDir $f
+    Write-Output "Downloading $url ..."
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -TimeoutSec 60
+    } catch {
+        throw "Failed to download Bible website file $f : $($_.Exception.Message)"
+    }
+}
+# Copy into the distro via /mnt/c (binary-safe, no encoding issues)
+$wslTmp = $tmpDir -replace '^([A-Za-z]):', '/mnt/$1' -replace '\\', '/'
+$wslTmp = $wslTmp.ToLower()
+foreach ($f in $bibleFiles) {
+    wsl -d $DistroName -u root -- bash -c "cp '$wslTmp/$f' /opt/bible/website/$f"
+    if ($LASTEXITCODE -ne 0) { throw "Failed to copy $f into distro" }
+}
+Write-Output "Bible website refreshed from GitHub."
+
 Write-Step "3/6 Building database from source (PostgreSQL, TimescaleDB, pgvector, pgvectorscale)"
 # Copy build-database.sh into the distro and run it. This compiles everything
 # from /opt/stage/ sources with no apt, no network, no Docker.
@@ -444,6 +472,33 @@ if ($extCheck -notmatch "timescaledb" -or $extCheck -notmatch "vector" -or $extC
 }
 Write-Output "Extensions verified: timescaledb, vector, vectorscale."
 
+Write-Step "3b/6 Setting up forum (database role, schema, supervisor)"
+# The base image has /opt/forum but the v2 installer was missing:
+#   - [program:forum] in the supervisor config
+#   - [supervisorctl]/[rpcinterface] sections (supervisorctl was broken)
+#   - the 'forum' PostgreSQL role and schema
+#   - FORUM_DB_PASS / FORUM_SECRET_KEY environment variables
+# setup-forum-v2.py does all of this idempotently (Kit 2026-10-07).
+$forumScript = Join-Path $PSScriptRoot "setup-forum-v2.py"
+if (-not (Test-Path $forumScript)) {
+    $forumUrl = "https://raw.githubusercontent.com/kitcosby/lampy-installer/$wantTag/setup-forum-v2.py"
+    Write-Output "setup-forum-v2.py not found locally; downloading from $forumUrl ..."
+    try {
+        Invoke-WebRequest -Uri $forumUrl -OutFile $forumScript -UseBasicParsing -TimeoutSec 60
+    } catch {
+        throw "setup-forum-v2.py not found at $forumScript and download failed: $($_.Exception.Message)"
+    }
+    if (-not (Test-Path $forumScript)) { throw "setup-forum-v2.py download failed silently." }
+    Write-Output "Downloaded setup-forum-v2.py."
+}
+Write-Output "Copying forum setup script into distro..."
+Get-Content -Path $forumScript -Raw | wsl -d $DistroName -u root -- bash -c "cat > /usr/local/bin/setup-forum-v2.py && chmod +x /usr/local/bin/setup-forum-v2.py"
+if ($LASTEXITCODE -ne 0) { throw "Failed to copy setup-forum-v2.py into distro" }
+Write-Output "Running forum setup (creates role, loads schema, patches supervisor)..."
+wsl -d $DistroName -u root -- python3 /usr/local/bin/setup-forum-v2.py
+if ($LASTEXITCODE -ne 0) { throw "Forum setup failed. See output above." }
+Write-Output "Forum setup complete."
+
 Write-Step "4/6 Storing password in locked file"
 # Password lives in /root/.lampy-secrets (600, root only). Never in config files.
 $pwB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Password))
@@ -491,7 +546,9 @@ Start-Sleep -Seconds 10
 $checks = @(
     @{ Name = "PostgreSQL"; Cmd = "wsl -d $DistroName -u postgres /usr/local/pgsql/bin/pg_isready" },
     @{ Name = "Apache";     WslUrl = "http://localhost:80/" },
-    @{ Name = "Ollama";     WslUrl = "http://localhost:11434/" }
+    @{ Name = "Ollama";     WslUrl = "http://localhost:11434/" },
+    @{ Name = "Bible";      WslUrl = "http://localhost:5057/" },
+    @{ Name = "Forum";      WslUrl = "http://localhost:8000/" }
 )
 $failed = 0
 foreach ($c in $checks) {
@@ -519,5 +576,8 @@ if ($failed -gt 0) {
     exit 1
 }
 Write-Output "`nLampy v2.0 installed and running."
+Write-Output "Home:    http://localhost/"
 Write-Output "Forum:   http://localhost/app/"
+Write-Output "Bible:   http://localhost/bible/"
+Write-Output "R Theory: http://localhost/r-theory/"
 Write-Output "Ollama:  http://localhost:11434/"
