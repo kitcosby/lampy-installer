@@ -374,7 +374,7 @@ Write-Step "2b/6 Refreshing Bible website from GitHub (Kit 2026-10-07)"
 # The base image predates the interlinear page. Fetch the latest website
 # files from cosbykit-afk/bible-project so fresh installs get the current
 # version (interlinear, papyrus theme, variant fixes).
-$bibleBase = "https://raw.githubusercontent.com/cosbykit-afk/bible-project/master/website"
+$bibleBase = "https://raw.githubusercontent.com/kitcosby/bible-project/master/website"
 $bibleFiles = @("app_v2.py", "papyrus-tile.png")
 $tmpDir = Join-Path $env:TEMP "lampy-bible-refresh"
 New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
